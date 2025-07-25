@@ -199,11 +199,11 @@ function calcTodayTradePnL(enrichedTrades: EnrichedTrade[], todayStr: string): n
  */
 function calcTodayFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): number {
   // 构建今日之前的 FIFO 栈
-  const fifo: Record<string, { qty: number; price: number, date: string }[]> = {};
+  const fifo: Record<string, { qty: number; price: number }[]> = {};
 
   // 1. 先构建今日交易的行为栈（与M5.1相同）
-  const longMap: Record<string, { qty: number; price: number, date: string }[]> = {};
-  const shortMap: Record<string, { qty: number; price: number, date: string }[]> = {};
+  const longMap: Record<string, { qty: number; price: number }[]> = {};
+  const shortMap: Record<string, { qty: number; price: number }[]> = {};
 
   // 2. 记录日内交易匹配的数量
   const dayTradeMatches: {
@@ -215,10 +215,10 @@ function calcTodayFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): nu
 
   // 按时间顺序处理今日交易，找出日内交易匹配
   enrichedTrades
-    // .filter(t => t.date.startsWith(todayStr))
+    .filter(t => t.date.startsWith(todayStr))
     .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
     .forEach(t => {
-      const { symbol, action, quantity, price, date } = t;
+      const { symbol, action, quantity, price } = t;
 
       // 初始化栈
       if (!longMap[symbol]) longMap[symbol] = [];
@@ -226,7 +226,7 @@ function calcTodayFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): nu
 
       if (action === 'buy') {
         // 买入：直接加入多头栈
-        longMap[symbol].push({ qty: quantity, price, date: date });
+        longMap[symbol].push({ qty: quantity, price });
       }
       else if (action === 'sell') {
         // 卖出：匹配今日多头栈
@@ -239,9 +239,7 @@ function calcTodayFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): nu
           const q = Math.min(batch.qty, remain);
           batch.qty -= q;
           remain -= q;
-          if (batch.date === todayStr){
-            matchedQty += q;
-          }
+          matchedQty += q;
           if (batch.qty === 0) longStack.shift();
         }
 
@@ -257,7 +255,7 @@ function calcTodayFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): nu
       }
       else if (action === 'short') {
         // 做空：直接加入空头栈
-        shortMap[symbol].push({ qty: quantity, price, date: date });
+        shortMap[symbol].push({ qty: quantity, price });
       }
       else if (action === 'cover') {
         // 回补：匹配今日空头栈
@@ -270,9 +268,7 @@ function calcTodayFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): nu
           const q = Math.min(batch.qty, remain);
           batch.qty -= q;
           remain -= q;
-          if (batch.date === todayStr){
-            matchedQty += q;
-          }
+          matchedQty += q;
           if (batch.qty === 0) shortStack.shift();
         }
 
@@ -293,11 +289,11 @@ function calcTodayFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): nu
     .filter(t => !t.date.startsWith(todayStr))
     .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
     .forEach(t => {
-      const { symbol, action, quantity, price, date } = t;
+      const { symbol, action, quantity, price } = t;
       if (!fifo[symbol]) fifo[symbol] = [];
       const stack = fifo[symbol];
       if (action === 'buy' || action === 'cover') {
-        stack.push({ qty: quantity, price, date });
+        stack.push({ qty: quantity, price });
       } else { // sell or short
         let remain = quantity;
         while (remain > 0 && stack.length) {
@@ -311,186 +307,25 @@ function calcTodayFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): nu
     });
 
   // 4. 对日内交易匹配的部分，应用FIFO计算
-  console.log(JSON.stringify(dayTradeMatches))
   let pnl = 0;
   for (const match of dayTradeMatches) {
     const { symbol, action, price, qty } = match;
-
+    const stack = fifo[symbol] || [];
     let remain = qty;
 
-    if (action === 'sell') {
-      const todayBuy = enrichedTrades.filter(t => t.symbol === symbol && t.date === todayStr && t.action === 'buy');
-      if (todayBuy.length > 0) {          
-        for (let index = 0; index < todayBuy.length; index++) {
-          const q = Math.min(todayBuy[index]!.quantity, remain);
-          pnl += (price - todayBuy[index]!.price) * q;
-          remain -= q;
-          if(remain === 0) break;
-        }
+    while (remain > 0 && stack.length) {
+      const batch = stack[0]!;
+      const q = Math.min(batch.qty, remain);
+
+      if (action === 'sell') {
+        pnl += (price - batch.price) * q;
+      } else { // cover
+        pnl += (batch.price - price) * q;
       }
-    } else { // cover
-      const todayShort = enrichedTrades.filter(t => t.symbol === symbol && t.date === todayStr && t.action === 'short');
-      if (todayShort.length > 0) {          
-        for (let index = 0; index < todayShort.length; index++) {
-          const q = Math.min(todayShort[index]!.quantity, remain);
-          pnl += (todayShort[index]!.price -price) * q;
-          remain -= q;
-          if(remain === 0) break;
-        }
-      }
-    }
-  }
 
-  return pnl;
-}
-
-/**
- * 计算历史交易盈亏（FIFO视角）
- * 按照先进先出原则，计算同一天内开仓并平仓的交易盈亏
- * 
- * @param enrichedTrades 交易记录数组
- * @param todayStr 今日日期字符串，格式为 YYYY-MM-DD
- * @returns 日内交易盈亏
- */
-function calcHistoryFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): number {
-  // 构建 FIFO 栈
-  const fifo: Record<string, { qty: number; price: number, date: string }[]> = {};
-
-  // 1. 先构建今日交易的行为栈（与M5.1相同）
-  const longMap: Record<string, { qty: number; price: number, date: string }[]> = {};
-  const shortMap: Record<string, { qty: number; price: number, date: string }[]> = {};
-
-  // 2. 记录历史交易匹配的数量
-  const dayTradeMatches: {
-    symbol: string;
-    action: 'sell' | 'cover';
-    price: number;
-    qty: number;
-  }[] = [];
-
-  // 按时间顺序处理今日交易，找出日内交易匹配
-  enrichedTrades
-    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
-    .forEach(t => {
-      const { symbol, action, quantity, price, date } = t;
-
-      // 初始化栈
-      if (!longMap[symbol]) longMap[symbol] = [];
-      if (!shortMap[symbol]) shortMap[symbol] = [];
-
-      if (action === 'buy') {
-        // 买入：直接加入多头栈
-        longMap[symbol].push({ qty: quantity, price, date });
-      }
-      else if (action === 'sell') {
-        // 卖出：匹配多头栈
-        const longStack = longMap[symbol];
-        let remain = quantity;
-        let matchedQty = 0;
-
-        while (remain > 0 && longStack.length > 0) {
-          const batch = longStack[0]!;
-          const q = Math.min(batch.qty, remain);
-          batch.qty -= q;
-          remain -= q;
-          if (batch.date !== todayStr){
-            matchedQty += q;
-          }
-          if (batch.qty === 0) longStack.shift();
-        }
-
-        // 记录匹配的历史交易
-        if (matchedQty > 0) {
-          dayTradeMatches.push({
-            symbol,
-            action: 'sell',
-            price,
-            qty: matchedQty
-          });
-        }
-      }
-      else if (action === 'short') {
-        // 做空：直接加入空头栈
-        shortMap[symbol].push({ qty: quantity, price, date });
-      }
-      else if (action === 'cover') {
-        // 回补：匹配历史空头栈
-        const shortStack = shortMap[symbol];
-        let remain = quantity;
-        let matchedQty = 0;
-
-        while (remain > 0 && shortStack.length > 0) {
-          const batch = shortStack[0]!;
-          const q = Math.min(batch.qty, remain);
-          batch.qty -= q;
-          remain -= q;
-          if (batch.date !== todayStr){
-            matchedQty += q;
-          }
-          if (batch.qty === 0) shortStack.shift();
-        }
-
-        // 记录匹配的历史交易
-        if (matchedQty > 0) {
-          dayTradeMatches.push({
-            symbol,
-            action: 'cover',
-            price,
-            qty: matchedQty
-          });
-        }
-      }
-    });
-
-  // // 3. 构建历史FIFO栈
-  // enrichedTrades
-  //   .filter(t => !t.date.startsWith(todayStr))
-  //   .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
-  //   .forEach(t => {
-  //     const { symbol, action, quantity, price } = t;
-  //     if (!fifo[symbol]) fifo[symbol] = [];
-  //     const stack = fifo[symbol];
-  //     if (action === 'buy' || action === 'cover') {
-  //       stack.push({ qty: quantity, price });
-  //     } else { // sell or short
-  //       let remain = quantity;
-  //       while (remain > 0 && stack.length) {
-  //         const batch = stack[0]!;
-  //         const q = Math.min(batch.qty, remain);
-  //         batch.qty -= q;
-  //         remain -= q;
-  //         if (batch.qty === 0) stack.shift();
-  //       }
-  //     }
-  //   });
-
-  // 4. 对历史交易匹配的部分，应用FIFO计算
-  console.log('历史交易匹配:', dayTradeMatches);
-  let pnl = 0;
-  for (const match of dayTradeMatches) {
-    const { symbol, action, price, qty } = match;
-    let remain = qty;
-
-    if (action === 'sell') {
-      const todayBuy = enrichedTrades.filter(t => t.symbol === symbol && t.date !== todayStr && t.action === 'buy');
-      if (todayBuy.length > 0) {          
-        for (let index = 0; index < todayBuy.length; index++) {
-          const q = Math.min(todayBuy[index]!.quantity, remain);
-          pnl += (price - todayBuy[index]!.price) * q;
-          remain -= q;
-          if(remain === 0) break;
-        }
-      }
-    } else { // cover
-      const todayShort = enrichedTrades.filter(t => t.symbol === symbol && t.date !== todayStr && t.action === 'short');
-      if (todayShort.length > 0) {          
-        for (let index = 0; index < todayShort.length; index++) {
-          const q = Math.min(todayShort[index]!.quantity, remain);
-          pnl += (todayShort[index]!.price -price) * q;
-          remain -= q;
-          if(remain === 0) break;
-        }
-      }
+      batch.qty -= q;
+      remain -= q;
+      if (batch.qty === 0) stack.shift();
     }
   }
 
@@ -587,7 +422,7 @@ export function calcMetrics(
     .reduce((acc, t) => acc + (t.realizedPnl || 0), 0);
 
   // 日内交易的 FIFO 盈亏已包含在 pnlFifo，需要剔除
-  const todayHistoricalRealizedPnl = calcHistoryFifoPnL(trades, todayStr);
+  const todayHistoricalRealizedPnl = todayRealizedPnlAll - pnlFifo;
 
   // M6: 今日总盈利变化 = 当日浮动盈亏 + 今天历史仓位平仓盈亏
   const todayFloatPnl = floatPnl; // 当日浮动盈亏（持仓浮盈）
@@ -634,7 +469,7 @@ export function calcMetrics(
     M4: todayHistoricalRealizedPnl,
     M5: {
       trade: pnlTrade,
-      fifo: todayHistoricalRealizedPnl + pnlFifo
+      fifo: pnlFifo
     },
     M6: todayTotalPnlChange,
     M7: {
