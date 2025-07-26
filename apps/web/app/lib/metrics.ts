@@ -360,7 +360,10 @@ function calcHistoryFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): 
   const longMap: Record<string, { qty: number; price: number, date: string }[]> = {};
   const shortMap: Record<string, { qty: number; price: number, date: string }[]> = {};
 
-  // 2. 记录历史交易匹配的数量
+  const coverToBuyMap: Record<string, { qty: number; price: number, date: string }[]> = {};
+  const sellToShortMap: Record<string, { qty: number; price: number, date: string }[]> = {};
+
+  // 2. 记录历史交易匹配的数量S
   const dayTradeMatches: {
     symbol: string;
     action: 'sell' | 'cover';
@@ -408,6 +411,15 @@ function calcHistoryFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): 
             qty: matchedQty
           });
         }
+
+        if (remain > 0){
+          shortMap[symbol].push({ qty: remain, price, date });
+          if (!sellToShortMap[symbol]) 
+          {
+            sellToShortMap[symbol] = [];
+          }
+          sellToShortMap[symbol].push({ qty: remain, price, date });
+        }
       }
       else if (action === 'short') {
         // 做空：直接加入空头栈
@@ -439,8 +451,18 @@ function calcHistoryFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): 
             qty: matchedQty
           });
         }
+
+        if(remain > 0){
+          longMap[symbol].push({ qty: remain, price, date });
+          if (!coverToBuyMap[symbol]) 
+          {
+            coverToBuyMap[symbol] = [];
+          }
+          coverToBuyMap[symbol].push({ qty: remain, price, date });
+        }
       }
     });
+  
 
   // // 3. 构建历史FIFO栈
   // enrichedTrades
@@ -481,6 +503,15 @@ function calcHistoryFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): 
           if(remain === 0) break;
         }
       }
+      else if (coverToBuyMap[symbol] && coverToBuyMap[symbol].length > 0) {
+        const batch = coverToBuyMap[symbol]!;
+        for (let index = 0; index < batch.length; index++) {
+          const q = Math.min(batch[index]!.qty, remain);
+          pnl += (batch[index]!.price -price) * q;
+          remain -= q;
+          if(remain === 0) break;
+        }
+      }
     } else { // cover
       const todayShort = enrichedTrades.filter(t => t.symbol === symbol && t.date !== todayStr && t.action === 'short');
       if (todayShort.length > 0) {          
@@ -491,10 +522,73 @@ function calcHistoryFifoPnL(enrichedTrades: EnrichedTrade[], todayStr: string): 
           if(remain === 0) break;
         }
       }
+      else if (sellToShortMap[symbol] && sellToShortMap[symbol].length > 0) {
+        const batch = sellToShortMap[symbol]!;
+        for (let index = 0; index < batch.length; index++) {
+          const q = Math.min(batch[index]!.qty, remain);
+          pnl += (batch[index]!.price -price) * q;
+          remain -= q;
+          if(remain === 0) break;
+        }
+      }
     }
   }
 
   return pnl;
+}
+
+/**
+ * 计算胜负笔数（FIFO 视角）
+ * 遍历所有交易，按先进先出原则逐笔比对开平仓，统计每一笔配对结果
+ * @param trades 交易记录数组
+ * @returns 包含 wins 与 losses 计数
+ */
+function calcWinLossLots(trades: EnrichedTrade[]): { wins: number; losses: number } {
+  const longFifo: Record<string, { qty: number; price: number }[]> = {};
+  const shortFifo: Record<string, { qty: number; price: number }[]> = {};
+
+  let wins = 0;
+  let losses = 0;
+
+  const sorted = [...trades].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+  for (const t of sorted) {
+    const { symbol, action, quantity, price } = t;
+
+    if (action === 'buy') {
+      if (!longFifo[symbol]) longFifo[symbol] = [];
+      longFifo[symbol].push({ qty: quantity, price });
+    } else if (action === 'sell') {
+      let remain = quantity;
+      const fifo = longFifo[symbol] || [];
+      while (remain > 0 && fifo.length > 0) {
+        const lot = fifo[0]!;
+        const q = Math.min(lot.qty, remain);
+        const pnl = (price - lot.price) * q;
+        if (pnl > 0) wins++; else if (pnl < 0) losses++;
+        lot.qty -= q;
+        remain -= q;
+        if (lot.qty === 0) fifo.shift();
+      }
+    } else if (action === 'short') {
+      if (!shortFifo[symbol]) shortFifo[symbol] = [];
+      shortFifo[symbol].push({ qty: quantity, price });
+    } else if (action === 'cover') {
+      let remain = quantity;
+      const fifo = shortFifo[symbol] || [];
+      while (remain > 0 && fifo.length > 0) {
+        const lot = fifo[0]!;
+        const q = Math.min(lot.qty, remain);
+        const pnl = (lot.price - price) * q;
+        if (pnl > 0) wins++; else if (pnl < 0) losses++;
+        lot.qty -= q;
+        remain -= q;
+        if (lot.qty === 0) fifo.shift();
+      }
+    }
+  }
+
+  return { wins, losses };
 }
 
 /**
@@ -526,7 +620,7 @@ function calcPeriodMetrics(dailyResults: DailyResult[], todayStr: string): { wtd
     const day = (lastDate.getDay() + 6) % 7; // Monday=0
     const monday = new Date(lastDate);
     monday.setDate(lastDate.getDate() - day);
-    const mondayStr = monday.toISOString().slice(0, 10);
+    const mondayStr = monday.getFullYear() + '-' + (monday.getMonth() + 1 > 9 ? monday.getMonth() + 1 : `0${monday.getMonth() + 1}`) + '-' + (monday.getDate() > 9 ? monday.getDate() : `0${monday.getDate()}`);
     return sumSince(list, mondayStr);
   }
 
@@ -588,10 +682,12 @@ export function calcMetrics(
 
   // 日内交易的 FIFO 盈亏已包含在 pnlFifo，需要剔除
   const todayHistoricalRealizedPnl = calcHistoryFifoPnL(trades, todayStr);
+  console.log('M4计算结果:', todayHistoricalRealizedPnl);
 
   // M6: 今日总盈利变化 = 当日浮动盈亏 + 今天历史仓位平仓盈亏
   const todayFloatPnl = floatPnl; // 当日浮动盈亏（持仓浮盈）
   const todayTotalPnlChange = todayFloatPnl + todayHistoricalRealizedPnl;
+  console.log('M5计算结果:', todayTotalPnlChange);
 
   // M7: 当日交易次数
   const todayTrades = trades.filter(t => t.date.startsWith(todayStr));
@@ -613,13 +709,11 @@ export function calcMetrics(
   const totalTrades = allTradesByType.B + allTradesByType.S + allTradesByType.P + allTradesByType.C;
 
   // M9: 历史已实现盈亏（不含今日）
-  const historicalRealizedPnl = trades
-    .filter(t => !t.date.startsWith(todayStr))
-    .reduce((acc, t) => acc + (t.realizedPnl || 0), 0);
+  const historicalRealizedPnl = todayHistoricalRealizedPnl + pnlFifo;
+  console.log('M9计算结果:', historicalRealizedPnl);
 
   // M10: 胜率
-  const winningTrades = trades.filter(t => (t.realizedPnl || 0) > 0).length;
-  const losingTrades = trades.filter(t => (t.realizedPnl || 0) < 0).length;
+  const { wins: winningTrades, losses: losingTrades } = calcWinLossLots(trades);
   const winRate = winningTrades + losingTrades > 0
     ? (winningTrades / (winningTrades + losingTrades)) * 100
     : 0;
